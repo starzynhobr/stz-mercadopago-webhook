@@ -78,7 +78,7 @@ export async function POST(req: Request) {
       signatureV1.length === computedSignature.length &&
       timingSafeEqual(Buffer.from(signatureV1, "hex"), Buffer.from(computedSignature, "hex"))
 
-    await db.collection("mercadoPagoEvents").add({
+    const eventDocRef = await db.collection("mercadoPagoEvents").add({
       receivedAt: new Date().toISOString(),
       headers: headersObj,
       rawBody,
@@ -99,62 +99,81 @@ export async function POST(req: Request) {
       (!!eventAction && eventAction.startsWith("payment."))
 
     if (validSignature && isPaymentEvent && rawNotificationId) {
-      const accessToken = process.env.MP_ACCESS_TOKEN
+      try {
+        const accessToken = process.env.MP_ACCESS_TOKEN
 
-      if (!accessToken) {
-        throw new Error("Missing MP_ACCESS_TOKEN")
-      }
+        if (!accessToken) {
+          throw new Error("Missing MP_ACCESS_TOKEN")
+        }
 
-      const paymentRes = await fetch(
-        `https://api.mercadopago.com/v1/payments/${encodeURIComponent(rawNotificationId)}`,
-        {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            "Content-Type": "application/json",
+        const paymentRes = await fetch(
+          `https://api.mercadopago.com/v1/payments/${encodeURIComponent(rawNotificationId)}`,
+          {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              "Content-Type": "application/json",
+            },
+            cache: "no-store",
           },
-          cache: "no-store",
-        },
-      )
+        )
 
-      if (!paymentRes.ok) {
-        throw new Error(`Mercado Pago payment lookup failed with status ${paymentRes.status}`)
+        if (!paymentRes.ok) {
+          throw new Error(`Mercado Pago payment lookup failed with status ${paymentRes.status}`)
+        }
+
+        const payment = (await paymentRes.json()) as Record<string, unknown>
+        const amount =
+          typeof payment.transaction_amount === "number"
+            ? payment.transaction_amount
+            : Number(payment.transaction_amount ?? 0)
+        const currency =
+          typeof payment.currency_id === "string" ? payment.currency_id : "BRL"
+        const status =
+          typeof payment.status === "string" ? payment.status : "unknown"
+        const payer =
+          payment.payer && typeof payment.payer === "object"
+            ? (payment.payer as Record<string, unknown>)
+            : null
+        const customerName = [payer?.first_name, payer?.last_name]
+          .filter((part): part is string => typeof part === "string" && !!part.trim())
+          .join(" ")
+          .trim() || null
+        const formattedAmount = formatAmount(amount, currency)
+        const message = customerName
+          ? `${customerName} pagou ${formattedAmount}`
+          : `Pagamento recebido de ${formattedAmount}`
+
+        await db.collection("paymentNotifications").add({
+          kind: "payment_notification",
+          paymentId: rawNotificationId,
+          amount,
+          currency,
+          customerName,
+          status,
+          title: "Novo pagamento recebido",
+          message,
+          createdAt: new Date().toISOString(),
+          read: false,
+          validSignature: true,
+        })
+
+        await eventDocRef.update({
+          paymentFetchAttempted: true,
+          paymentFetchSuccess: true,
+          paymentFetchError: null,
+        })
+      } catch (fetchError) {
+        const paymentFetchError =
+          fetchError instanceof Error ? fetchError.message : "Unknown payment fetch error"
+
+        console.error("Payment fetch error:", fetchError)
+
+        await eventDocRef.update({
+          paymentFetchAttempted: true,
+          paymentFetchSuccess: false,
+          paymentFetchError: paymentFetchError.slice(0, 300),
+        })
       }
-
-      const payment = (await paymentRes.json()) as Record<string, unknown>
-      const amount =
-        typeof payment.transaction_amount === "number"
-          ? payment.transaction_amount
-          : Number(payment.transaction_amount ?? 0)
-      const currency =
-        typeof payment.currency_id === "string" ? payment.currency_id : "BRL"
-      const status =
-        typeof payment.status === "string" ? payment.status : "unknown"
-      const payer =
-        payment.payer && typeof payment.payer === "object"
-          ? (payment.payer as Record<string, unknown>)
-          : null
-      const customerName = [payer?.first_name, payer?.last_name]
-        .filter((part): part is string => typeof part === "string" && !!part.trim())
-        .join(" ")
-        .trim() || null
-      const formattedAmount = formatAmount(amount, currency)
-      const message = customerName
-        ? `${customerName} pagou ${formattedAmount}`
-        : `Pagamento recebido de ${formattedAmount}`
-
-      await db.collection("paymentNotifications").add({
-        kind: "payment_notification",
-        paymentId: rawNotificationId,
-        amount,
-        currency,
-        customerName,
-        status,
-        title: "Novo pagamento recebido",
-        message,
-        createdAt: new Date().toISOString(),
-        read: false,
-        validSignature: true,
-      })
     }
 
     return new Response("ok", { status: 200 })
