@@ -168,6 +168,21 @@ export async function POST(req: Request) {
 
         console.error("Payment fetch error:", fetchError)
 
+        await db.collection("paymentNotifications").add({
+          kind: "payment_notification",
+          paymentId: rawNotificationId,
+          amount: null,
+          currency: "BRL",
+          customerName: null,
+          status: "simulated",
+          title: "Pagamento detectado",
+          message: "Notificação de pagamento recebida do Mercado Pago",
+          createdAt: new Date().toISOString(),
+          read: false,
+          validSignature: true,
+          source: "mercadopago-webhook-fallback",
+        })
+
         await eventDocRef.update({
           paymentFetchAttempted: true,
           paymentFetchSuccess: false,
